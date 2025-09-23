@@ -8,8 +8,10 @@ import pandas as pd
 from bson import ObjectId
 import json
 from geopy.distance import geodesic
+from geopy.geocoders import Nominatim
 import folium
 from collections import defaultdict
+import numpy as np
 
 app = FastAPI(title="Multi-Tenant Sales Analytics API", version="1.0.0")
 
@@ -30,6 +32,8 @@ class SalesAnalytics:
     def __init__(self):
         self.client = client
         self._global_products_cache: Optional[Dict[str, str]] = None
+        self._geo_cache: Dict[str, Dict[str, Optional[str]]] = {}
+        self._geolocator: Optional[Nominatim] = None
         
     def get_all_databases(self) -> List[str]:
         """Récupère toutes les bases de données du cluster"""
@@ -168,11 +172,24 @@ class SalesAnalytics:
                             # convert to string
                             global_id_str = str(global_id) if global_id is not None else None
                             name = products_map.get(global_id_str) if global_id_str else None
-                            qty = item.get('quantity') or item.get('qty') or item.get('qte') or 0
+                            # quantité vendue: différents schémas possibles
+                            raw_qty = (
+                                item.get('saleQuantity')
+                                or item.get('qty')
+                                or item.get('qte')
+                                or item.get('quantity')
+                                or 1
+                            )
                             try:
-                                qty = int(qty)
+                                qty = int(raw_qty)
                             except Exception:
-                                qty = 0
+                                qty = 1
+                            returned = item.get('returnedQuantity') or 0
+                            try:
+                                returned = int(returned)
+                            except Exception:
+                                returned = 0
+                            qty = max(qty - returned, 0)
 
                             entry = {
                                 'global_product_id': global_id_str,
@@ -214,6 +231,8 @@ class SalesAnalytics:
             group = {
                 'latitude': sale['latitude'],
                 'longitude': sale['longitude'],
+                'country': None,
+                'city': None,
                 'sales': [sale],
                 'total_sales': 1,
                 'total_amount': 0,
@@ -271,15 +290,29 @@ class SalesAnalytics:
                 group['longitude'] = avg_lon
             
             group['tenant_count'] = len(group['tenants'])
+            # Résolution pays/ville (approx, avec cache)
+            geo = self._reverse_geocode_country_city(group['latitude'], group['longitude'])
+            group['country'] = geo.get('country')
+            group['city'] = geo.get('city')
             location_groups.append(group)
         
         # Trier par nombre de ventes décroissant
         location_groups.sort(key=lambda x: x['total_sales'], reverse=True)
         
-        # Ajouter top_products (tri décroissant quantité)
+        # Ajouter products_all (tous les produits) + top_products (compat)
         for g in location_groups:
-            top = sorted(g['products_summary'].items(), key=lambda x: x[1], reverse=True)
-            g['top_products'] = [{'name': name, 'quantity': int(qty)} for name, qty in top[:5]]
+            if not g['products_summary']:
+                g['products_all'] = []
+                g['top_products'] = []
+                continue
+            names = np.array(list(g['products_summary'].keys()))
+            qty = np.array(list(g['products_summary'].values()), dtype=float)
+            order_all = np.argsort(qty)[::-1]
+            g['products_all'] = [
+                {'name': str(names[i]), 'quantity': int(qty[i])}
+                for i in order_all
+            ]
+            g['top_products'] = g['products_all'][:5]
         return location_groups
     
     def _extract_amount(self, sale: Dict) -> float:
@@ -397,6 +430,28 @@ class SalesAnalytics:
         except Exception as e:
             print(f"[ProductsList] Erreur: {e}")
             return []
+
+    def _reverse_geocode_country_city(self, lat: float, lon: float) -> Dict[str, Optional[str]]:
+        """Retourne {country, city} pour des coordonnées, avec cache simple et tolérance.
+        """
+        try:
+            key = f"{round(lat, 3)}|{round(lon, 3)}"
+            if key in self._geo_cache:
+                return self._geo_cache[key]
+            if self._geolocator is None:
+                self._geolocator = Nominatim(user_agent="emaquis_kpi")
+            location = self._geolocator.reverse((lat, lon), language='en')
+            country = None
+            city = None
+            if location and location.raw and 'address' in location.raw:
+                addr = location.raw['address']
+                country = addr.get('country')
+                city = addr.get('city') or addr.get('town') or addr.get('village') or addr.get('county') or addr.get('state')
+            result = {'country': country, 'city': city}
+            self._geo_cache[key] = result
+            return result
+        except Exception:
+            return {'country': None, 'city': None}
 
 # Instance globale
 sales_analytics = SalesAnalytics()
@@ -542,9 +597,11 @@ async def get_sales_map(radius_km: float = 1.0, product_id: Optional[str] = None
         if not locations:
             raise HTTPException(status_code=404, detail="Aucune vente avec coordonnées trouvée")
         
-        # Calculer le centre de la carte
-        center_lat = sum(loc['latitude'] for loc in locations) / len(locations)
-        center_lon = sum(loc['longitude'] for loc in locations) / len(locations)
+        # Calculer le centre de la carte (NumPy pour robustesse et vitesse)
+        lat_arr = np.array([loc['latitude'] for loc in locations], dtype=float)
+        lon_arr = np.array([loc['longitude'] for loc in locations], dtype=float)
+        center_lat = float(lat_arr.mean())
+        center_lon = float(lon_arr.mean())
         
         # Créer la carte
         m = folium.Map(
@@ -567,7 +624,8 @@ async def get_sales_map(radius_km: float = 1.0, product_id: Optional[str] = None
             
             # Popup avec les informations détaillées
             tenants_info = "<br>".join([f"• {tenant}: {count} ventes" for tenant, count in loc['tenants'].items()])
-            products_info = "<br>".join([f"• {p['name']}: {p['quantity']}" for p in loc.get('top_products', [])])
+            # Construire la liste HTML de tous les produits vendus
+            products_info = "<br>".join([f"• {p['name']}: {p['quantity']}" for p in loc.get('products_all', [])])
             popup_text = f"""
             <div style="min-width:200px;">
                 <b>📍 Localisation</b><br>
