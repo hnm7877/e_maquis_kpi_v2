@@ -1379,10 +1379,33 @@ async def get_sales_map(radius_km: float = 1.0, product_id: Optional[str] = None
         center_lat = float(lat_arr.mean())
         center_lon = float(lon_arr.mean())
         
-        # Créer la carte
+        # Calculer la distance maximale pour ajuster le zoom
+        if len(locations) > 1:
+            max_distance = 0
+            for i in range(len(locations)):
+                for j in range(i+1, len(locations)):
+                    dist = geodesic(
+                        (locations[i]['latitude'], locations[i]['longitude']),
+                        (locations[j]['latitude'], locations[j]['longitude'])
+                    ).kilometers
+                    max_distance = max(max_distance, dist)
+            
+            # Ajuster le zoom en fonction de la distance maximale
+            if max_distance < 1:
+                zoom_start = 15
+            elif max_distance < 5:
+                zoom_start = 12
+            elif max_distance < 20:
+                zoom_start = 10
+            else:
+                zoom_start = 8
+        else:
+            zoom_start = 12
+        
+        # Créer la carte avec un meilleur centrage
         m = folium.Map(
             location=[center_lat, center_lon],
-            zoom_start=10,
+            zoom_start=zoom_start,
             tiles='OpenStreetMap'
         )
         
