@@ -110,3 +110,4 @@ if __name__ == "__main__":
     else:
         print("\n💥 Certains tests ont échoué")
         sys.exit(1)
+
