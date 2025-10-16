@@ -16,6 +16,10 @@ from prophet import Prophet
 from prophet.plot import plot_plotly, plot_components_plotly
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 import warnings
+import asyncio
+from functools import lru_cache
+import time
+from concurrent.futures import ThreadPoolExecutor
 warnings.filterwarnings('ignore')
 
 app = FastAPI(title="Multi-Tenant Sales Analytics API", version="1.0.0")
@@ -39,9 +43,14 @@ class SalesAnalytics:
         self._global_products_cache: Optional[Dict[str, str]] = None
         self._geo_cache: Dict[str, Dict[str, Optional[str]]] = {}
         self._geolocator: Optional[Nominatim] = None
+        self._databases_cache: Optional[List[str]] = None
+        self._cache_ttl = 300  # 5 minutes cache TTL
+        self._last_cache_time = 0
+        self._executor = ThreadPoolExecutor(max_workers=4)
         
+    @lru_cache(maxsize=1)
     def get_all_databases(self) -> List[str]:
-        """Récupère toutes les bases de données du cluster"""
+        """Récupère toutes les bases de données du cluster avec cache"""
         try:
             # Filtrer les bases système
             system_dbs = ['admin', 'local', 'config']
@@ -51,37 +60,96 @@ class SalesAnalytics:
             print(f"Erreur lors de la récupération des BDs: {e}")
             return []
     
-    def get_sales_from_all_tenants(self) -> List[Dict]:
-        """Récupère toutes les ventes de tous les tenants"""
-        all_sales = []
-        databases = self.get_all_databases()
+    def get_databases_with_sales(self) -> List[str]:
+        """Récupère uniquement les bases de données qui ont une collection 'sales'"""
+        current_time = time.time()
         
-        for db_name in databases:
+        # Vérifier si le cache est encore valide
+        if (self._databases_cache is not None and 
+            current_time - self._last_cache_time < self._cache_ttl):
+            return self._databases_cache
+        
+        try:
+            databases = self.get_all_databases()
+            databases_with_sales = []
+            
+            for db_name in databases:
+                try:
+                    db = self.client[db_name]
+                    # Vérifier si la collection 'sales' existe et n'est pas vide
+                    if 'sales' in db.list_collection_names():
+                        sales_collection = db['sales']
+                        # Vérifier que la collection n'est pas vide
+                        if sales_collection.count_documents({}) > 0:
+                            databases_with_sales.append(db_name)
+                            print(f"{db_name} a une collection 'sales' avec des donnees")
+                        else:
+                            print(f"{db_name} a une collection 'sales' vide")
+                    else:
+                        print(f"{db_name} n'a pas de collection 'sales'")
+                except Exception as e:
+                    print(f"Erreur lors de la verification de {db_name}: {e}")
+                    continue
+            
+            # Mettre à jour le cache
+            self._databases_cache = databases_with_sales
+            self._last_cache_time = current_time
+            
+            print(f"{len(databases_with_sales)} bases de donnees avec des ventes trouvees")
+            return databases_with_sales
+            
+        except Exception as e:
+            print(f"Erreur lors de la récupération des BDs avec ventes: {e}")
+            return []
+    
+    def get_sales_from_all_tenants(self) -> List[Dict]:
+        """Récupère toutes les ventes de tous les tenants avec optimisations"""
+        all_sales = []
+        # Utiliser uniquement les bases de données qui ont des ventes
+        databases = self.get_databases_with_sales()
+        
+        if not databases:
+            print("Aucune base de donnees avec des ventes trouvee")
+            return []
+        
+        def fetch_sales_from_db(db_name):
+            """Fonction pour récupérer les ventes d'une base de données"""
             try:
                 db = self.client[db_name]
-                # Vérifier si la collection 'sales' existe
-                if 'sales' in db.list_collection_names():
-                    sales_collection = db['sales']
-                    sales_data = list(sales_collection.find({}))
-                    
-                    # Ajouter le nom de la BD (tenant) à chaque document et convertir les ObjectId
-                    processed_sales = []
-                    for sale in sales_data:
-                        sale['tenant_id'] = db_name
-                        # Convertir tous les ObjectId en string de manière récursive
-                        processed_sale = self._convert_objectids_to_strings(sale)
-                        processed_sales.append(processed_sale)
-                    
-                    all_sales.extend(processed_sales)
-                    print(f"✅ {len(sales_data)} ventes récupérées de {db_name}")
-                else:
-                    print(f"⚠️ Collection 'sales' non trouvée dans {db_name}")
-                    
+                sales_collection = db['sales']
+                
+                # Récupérer TOUS les champs pour avoir accès aux coordonnées géographiques
+                sales_data = list(sales_collection.find({}))
+                
+                # Ajouter le nom de la BD (tenant) à chaque document et convertir les ObjectId
+                processed_sales = []
+                for sale in sales_data:
+                    sale['tenant_id'] = db_name
+                    # Convertir tous les ObjectId en string de manière récursive
+                    processed_sale = self._convert_objectids_to_strings(sale)
+                    processed_sales.append(processed_sale)
+                
+                return processed_sales, db_name
+                
             except Exception as e:
-                print(f"❌ Erreur avec la BD {db_name}: {e}")
-                continue
+                print(f"Erreur avec la BD {db_name}: {e}")
+                return [], db_name
         
-        print(f"🎯 Total: {len(all_sales)} ventes récupérées de {len(databases)} bases de données")
+        # Utiliser ThreadPoolExecutor pour récupérer les données en parallèle
+        with ThreadPoolExecutor(max_workers=min(len(databases), 4)) as executor:
+            futures = [executor.submit(fetch_sales_from_db, db_name) for db_name in databases]
+            
+            for future in futures:
+                try:
+                    sales_data, db_name = future.result(timeout=30)  # Timeout de 30 secondes
+                    if sales_data:
+                        all_sales.extend(sales_data)
+                        print(f"{len(sales_data)} ventes recuperees de {db_name}")
+                except Exception as e:
+                    print(f"Erreur lors de la recuperation: {e}")
+                    continue
+        
+        print(f"Total: {len(all_sales)} ventes recuperees de {len(databases)} bases de donnees")
         return all_sales
     
     def _convert_objectids_to_strings(self, obj):
@@ -95,8 +163,9 @@ class SalesAnalytics:
         else:
             return obj
     
+    @lru_cache(maxsize=1)
     def get_sales_analytics(self) -> Dict:
-        """Calcule les KPIs principaux des ventes"""
+        """Calcule les KPIs principaux des ventes avec cache"""
         all_sales = self.get_sales_from_all_tenants()
         
         if not all_sales:
@@ -147,8 +216,32 @@ class SalesAnalytics:
         # Filtrer les ventes qui ont des coordonnées
         sales_with_coords = []
         for sale in all_sales:
-            lat = sale.get('latitude')
-            lon = sale.get('longitude')
+            # Chercher les coordonnées dans différents champs possibles
+            lat = None
+            lon = None
+            
+            # Champs directs
+            lat = sale.get('latitude') or sale.get('lat') or sale.get('lng_lat')
+            lon = sale.get('longitude') or sale.get('lon') or sale.get('lng') or sale.get('lng_lon')
+            
+            # Chercher dans les objets imbriqués
+            if lat is None or lon is None:
+                location = sale.get('location') or sale.get('address') or sale.get('geo')
+                if location and isinstance(location, dict):
+                    lat = lat or location.get('latitude') or location.get('lat') or location.get('lng_lat')
+                    lon = lon or location.get('longitude') or location.get('lon') or location.get('lng') or location.get('lng_lon')
+            
+            # Chercher dans les coordonnées GPS
+            if lat is None or lon is None:
+                gps = sale.get('gps') or sale.get('coordinates') or sale.get('coords')
+                if gps and isinstance(gps, dict):
+                    lat = lat or gps.get('latitude') or gps.get('lat')
+                    lon = lon or gps.get('longitude') or gps.get('lon')
+                elif gps and isinstance(gps, list) and len(gps) >= 2:
+                    # Format [longitude, latitude] ou [latitude, longitude]
+                    lat = lat or gps[1] if len(gps) >= 2 else None
+                    lon = lon or gps[0] if len(gps) >= 2 else None
+            
             if lat is not None and lon is not None:
                 try:
                     lat = float(lat)
@@ -939,6 +1032,7 @@ class SalesAnalytics:
         except Exception as e:
             return {"error": f"Erreur lors de l'analyse des insights pour le produit {product_name}: {str(e)}"}
 
+    @lru_cache(maxsize=1)
     def get_products_list(self) -> List[str]:
         """Récupère la liste de tous les produits uniques à partir des vraies données"""
         try:
@@ -1258,6 +1352,10 @@ async def get_sales_locations(radius_km: float = 1.0, product_id: Optional[str] 
     """Récupère les ventes regroupées par localisation géographique"""
     try:
         locations = sales_analytics.get_sales_by_location(radius_km, product_id=product_id, product_name=product_name)
+        
+        if not locations:
+            raise HTTPException(status_code=404, detail="Aucune vente avec coordonnées trouvée")
+        
         return {
             "locations": locations,
             "total_locations": len(locations),
@@ -1449,6 +1547,94 @@ async def get_products():
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.post("/cache/clear")
+async def clear_cache():
+    """Vide le cache pour forcer le rechargement des données"""
+    try:
+        # Vider les caches LRU
+        sales_analytics.get_all_databases.cache_clear()
+        sales_analytics.get_sales_analytics.cache_clear()
+        sales_analytics.get_products_list.cache_clear()
+        
+        # Réinitialiser les caches internes
+        sales_analytics._databases_cache = None
+        sales_analytics._global_products_cache = None
+        sales_analytics._last_cache_time = 0
+        
+        return {"message": "Cache vidé avec succès"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erreur lors du vidage du cache: {str(e)}")
+
+@app.get("/cache/status")
+async def get_cache_status():
+    """Retourne le statut du cache"""
+    try:
+        current_time = time.time()
+        cache_age = current_time - sales_analytics._last_cache_time if sales_analytics._last_cache_time > 0 else 0
+        
+        return {
+            "databases_cache_valid": sales_analytics._databases_cache is not None and cache_age < sales_analytics._cache_ttl,
+            "cache_age_seconds": cache_age,
+            "cache_ttl_seconds": sales_analytics._cache_ttl,
+            "cached_databases_count": len(sales_analytics._databases_cache) if sales_analytics._databases_cache else 0
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erreur lors de la récupération du statut du cache: {str(e)}")
+
+@app.get("/debug/sales-sample")
+async def debug_sales_sample():
+    """Debug: Retourne un échantillon de données de ventes pour voir la structure"""
+    try:
+        all_sales = sales_analytics.get_sales_from_all_tenants()
+        if not all_sales:
+            return {"error": "Aucune donnée de vente trouvée"}
+        
+        # Prendre les 3 premières ventes comme échantillon
+        sample_sales = all_sales[:3]
+        
+        # Analyser les champs disponibles
+        available_fields = set()
+        geo_fields = []
+        location_analysis = []
+        
+        for i, sale in enumerate(sample_sales):
+            sale_analysis = {
+                "sale_index": i,
+                "tenant_id": sale.get('tenant_id', 'unknown'),
+                "fields": list(sale.keys()),
+                "geo_fields_found": [],
+                "location_objects": []
+            }
+            
+            for key in sale.keys():
+                available_fields.add(key)
+                if any(geo_word in key.lower() for geo_word in ['lat', 'lon', 'coord', 'geo', 'location', 'address', 'gps']):
+                    geo_fields.append(key)
+                    sale_analysis["geo_fields_found"].append(key)
+                
+                # Analyser les objets qui pourraient contenir des coordonnées
+                value = sale[key]
+                if isinstance(value, dict):
+                    if any(geo_word in str(value).lower() for geo_word in ['lat', 'lon', 'coord', 'geo']):
+                        sale_analysis["location_objects"].append({
+                            "field": key,
+                            "content": value
+                        })
+            
+            location_analysis.append(sale_analysis)
+        
+        return {
+            "total_sales": len(all_sales),
+            "sample_sales": sample_sales,
+            "available_fields": sorted(list(available_fields)),
+            "geo_related_fields": list(set(geo_fields)),
+            "location_analysis": location_analysis,
+            "has_latitude": any('latitude' in sale for sale in sample_sales),
+            "has_longitude": any('longitude' in sale for sale in sample_sales)
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erreur lors du debug: {str(e)}")
+
 @app.get("/prophet/compare-tenants")
 async def compare_tenant_predictions(days_ahead: int = 30):
     """Compare les prédictions entre tous les tenants"""
@@ -1601,20 +1787,20 @@ async def get_prophet_accuracy_metrics(tenant_id: Optional[str] = None):
 
 if __name__ == "__main__":
     import uvicorn
-    print("🚀 Démarrage du serveur Multi-Tenant Sales Analytics")
-    print("📊 Connexion au cluster MongoDB...")
+    print("Demarrage du serveur Multi-Tenant Sales Analytics")
+    print("Connexion au cluster MongoDB...")
     
     # Test de connexion
     try:
         client.admin.command('ping')
-        print("✅ Connexion MongoDB réussie")
+        print("Connexion MongoDB reussie")
         
         # Afficher les BDs disponibles
         analytics = SalesAnalytics()
         dbs = analytics.get_all_databases()
-        print(f"📁 {len(dbs)} bases de données trouvées: {dbs}")
+        print(f"{len(dbs)} bases de donnees trouvees: {dbs}")
         
     except Exception as e:
-        print(f"❌ Erreur de connexion MongoDB: {e}")
+        print(f"Erreur de connexion MongoDB: {e}")
     
     uvicorn.run(app, host="127.0.0.1", port=8001)
